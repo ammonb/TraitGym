@@ -22,6 +22,7 @@ include: "rules/features/maf.smk"
 include: "rules/features/nucleotide_transformer.smk"
 include: "rules/features/sei.smk"
 include: "rules/features/specieslm.smk"
+include: "rules/features/alpha_genome.smk"
 include: "rules/model.smk"
 
 

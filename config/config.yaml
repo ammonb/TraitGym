@@ -38,6 +38,8 @@ complex_traits_disease:
   - T2D_BMI
 
 feature_sets:
+  AlphaGenome:
+    - AlphaGenome
   CADD:
     - CADD
   Sei:
