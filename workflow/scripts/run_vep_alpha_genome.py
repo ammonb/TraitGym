@@ -9,7 +9,7 @@ Usage:
     --chunk 256
 """
 
-import os
+import os, uuid, pickle
 import argparse
 import pandas as pd
 from tqdm import tqdm
@@ -32,6 +32,10 @@ def build_parser():
     p.add_argument("--chunk", type=int, default=256, help="Variants per API batch (looped anyway)")
     p.add_argument("--api-key", default=os.environ.get("ALPHAGENOME_API_KEY"),
                    help="If unset, read from env ALPHAGENOME_API_KEY")
+    p.add_argument("--cache-dir", default="cache/alphagenome_raw",
+                   help="Directory to store/read raw per-chunk tidy outputs (parquet).")
+    p.add_argument("--no-resume", action="store_true",
+                   help="Do NOT use cache; always rescore (default is resume).")
     
     return p
 
@@ -45,19 +49,43 @@ def peek(df, name, n=3):
     for c in obj_cols:
         print(f"- sample types in {c}:",
               df[c].head(20).map(type).unique()[:5])
-        
+
+
+
+
+def load_cache_dict(cache_dir):
+    print("Loading cached chunks...")
+    cache = {}
+    for p in Path(cache_dir).glob("batch_*.pkl"):
+        with open(p, "rb") as f:
+            batch = pickle.load(f)          # list of score objects
+        for obj in batch:
+            ad = obj[0]          # first AnnData for that variant
+            v_id=str(ad.uns["variant"])  
+            cache[v_id] = obj                      
+    return cache
+
 def main():
     args = build_parser().parse_args()
     if not args.api_key:
         raise SystemExit("Set --api-key or ALPHAGENOME_API_KEY")
 
+    # ---- caching setup ----
+    cached_variants = {}
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    if cache_dir:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if not args.no_resume:
+            cached_variants = load_cache_dict(args.cache_dir)
+
+
     # Load variants
-    df = pd.read_parquet(args.input)
+    df = pd.read_parquet(args.input)      
 
     df["variant_id"] = (
         df["chrom"].astype(str).str.replace("^chr", "", regex=True).radd("chr")
         + ":" + df["pos"].astype(int).astype(str)
-        + ":" + df["ref"] + ":" + df["alt"]
+        + ":" + df["ref"] + ">" + df["alt"]
     )
     
     # Map/standardize columns if needed
@@ -93,22 +121,42 @@ def main():
     ]
 
     results = []
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Scoring variants"):
-        v = genome.Variant(
-            chromosome=f"chr{row.chr}" if not str(row.chr).startswith("chr") else str(row.chr),
-            position=int(row.pos),
-            reference_bases=row.ref,
-            alternate_bases=row.alt,
-            name=row.variant_id,
-        )
-        interval = v.reference_interval.resize(seq_len)
-        scores = model.score_variant(
-            interval=interval,
-            variant=v,
-            variant_scorers=selected,
-            organism=organism,
-        )
-        results.append(scores)
+    for start in tqdm(range(0, len(df), args.chunk), desc=f"Scoring variants (chunk={args.chunk})"):
+        
+        batch = df.iloc[start:start + args.chunk]
+        variants, intervals = [], []
+        for r in batch.itertuples(index=False):
+            
+            if r.variant_id in cached_variants:
+                results.append(cached_variants[r.variant_id])
+                continue
+
+            v = genome.Variant(
+                chromosome=f"chr{r.chr}" if not str(r.chr).startswith("chr") else str(r.chr),
+                position=int(r.pos),
+                reference_bases=r.ref,
+                alternate_bases=r.alt,
+                name=r.variant_id,
+            )
+            variants.append(v)
+            intervals.append(v.reference_interval.resize(seq_len))
+
+        if len(variants):
+            batch_scores = model.score_variants(
+                intervals=intervals,
+                variants=variants,
+                variant_scorers=selected,
+                organism=organism,
+                progress_bar=False,
+            )
+            
+            uid = uuid.uuid4().hex
+            cache_path = cache_dir / f"batch_{start:07d}_{uid}.pkl"
+            with open(cache_path, "wb") as f:
+                pickle.dump(batch_scores, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+             
+            results.extend(batch_scores)
 
     tidy = variant_scorers.tidy_scores(results)  # long-form data frame
 
