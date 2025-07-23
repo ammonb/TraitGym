@@ -152,9 +152,9 @@ def main():
     zs = wide.mean(axis=1).rename("score").to_frame()
 
     for p in [args.out_features, args.out_score]:
-    if p:
-        Path(p).parent.mkdir(parents=True, exist_ok=True)
-        
+        if p:
+            Path(p).parent.mkdir(parents=True, exist_ok=True)
+
     # write only if paths were provided
     if args.out_features: wide.reset_index().to_parquet(args.out_features, index=False)
     if args.out_score:    zs.reset_index().to_parquet(args.out_score, index=False)
