@@ -51,8 +51,6 @@ def peek(df, name, n=3):
               df[c].head(20).map(type).unique()[:5])
 
 
-
-
 def load_cache_dict(cache_dir):
     print("Loading cached chunks...")
     cache = {}
@@ -65,10 +63,72 @@ def load_cache_dict(cache_dir):
             cache[v_id] = obj                      
     return cache
 
+
+def process_chunk(results, out_features, out_score, chunk_count):
+    tidy = variant_scorers.tidy_scores(results)  # long-form data frame
+
+    # Cast to str and numeric
+    tidy["variant_id"]      = tidy["variant_id"].astype(str)
+    tidy["output_type"]     = tidy["output_type"].astype(str)
+    tidy["variant_scorer"]  = tidy["variant_scorer"].astype(str)
+    tidy["raw_score"]       = pd.to_numeric(tidy["raw_score"], errors="coerce")
+
+    # Keep only needed cols
+    KEEP = ["variant_id", "output_type", "variant_scorer", "raw_score"]
+    tidy = tidy[KEEP].copy()
+    
+    counts = tidy.groupby(
+        ["variant_id", "output_type", "variant_scorer"], observed=True
+        ).raw_score.count().reset_index(name="count")
+
+    # one scalar per (variant, track/scorer)
+    scores = (tidy.groupby(["variant_id","output_type","variant_scorer"], observed=True)
+                .raw_score.mean()
+                .rename("score")
+                .reset_index())
+ 
+    # wide matrix
+    wide = scores.pivot(index="variant_id",
+                        columns=["output_type","variant_scorer"],
+                        values="score")
+    
+    # some scores don't exist for all regions. Impute with mean value
+    wide = wide.fillna(wide.mean())
+
+    wide.columns = [".".join(c) for c in wide.columns]
+
+    # optional zero-shot single column
+    zs = wide.mean(axis=1).rename("score").to_frame()
+
+    # write only if paths were provided
+    if out_features: 
+        wide.reset_index().to_parquet(
+            out_features,
+            engine="fastparquet",
+            append=(chunk_count != 0),
+            index=False
+        )
+    
+    if out_score:    
+        zs.reset_index().to_parquet(
+            out_score,
+            engine="fastparquet",
+            append=(chunk_count != 0),
+            index=False
+        )
+
 def main():
     args = build_parser().parse_args()
     if not args.api_key:
         raise SystemExit("Set --api-key or ALPHAGENOME_API_KEY")
+
+    if not args.out_features and not args.out_score:
+         raise SystemExit("Nothing to write: provide --out-features and/or --out-score") 
+
+    # files paths exist and are empty 
+    for p in [args.out_features, args.out_score]:
+        if p:
+            Path(p).parent.mkdir(parents=True, exist_ok=True)
 
     # ---- caching setup ----
     cached_variants = {}
@@ -77,7 +137,6 @@ def main():
         cache_dir.mkdir(parents=True, exist_ok=True)
         if not args.no_resume:
             cached_variants = load_cache_dict(args.cache_dir)
-
 
     # Load variants
     df = pd.read_parquet(args.input)      
@@ -120,15 +179,15 @@ def main():
         if organism.value in variant_scorers.SUPPORTED_ORGANISMS[sc.base_variant_scorer]
     ]
 
-    results = []
+    chunk_count = 0
     for start in tqdm(range(0, len(df), args.chunk), desc=f"Scoring variants (chunk={args.chunk})"):
-        
+        block_results = []    
         batch = df.iloc[start:start + args.chunk]
         variants, intervals = [], []
         for r in batch.itertuples(index=False):
             
             if r.variant_id in cached_variants:
-                results.append(cached_variants[r.variant_id])
+                block_results.append(cached_variants[r.variant_id])
                 continue
 
             v = genome.Variant(
@@ -155,62 +214,12 @@ def main():
             with open(cache_path, "wb") as f:
                 pickle.dump(batch_scores, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-             
-            results.extend(batch_scores)
-
-    tidy = variant_scorers.tidy_scores(results)  # long-form data frame
-
-    # Cast to str and numeric
-    tidy["variant_id"]      = tidy["variant_id"].astype(str)
-    tidy["output_type"]     = tidy["output_type"].astype(str)
-    tidy["variant_scorer"]  = tidy["variant_scorer"].astype(str)
-    tidy["raw_score"]       = pd.to_numeric(tidy["raw_score"], errors="coerce")
+            block_results.extend(batch_scores)
+            
+        process_chunk(block_results, args.out_features, args.out_score, chunk_count)
+        chunk_count += 1
+        print ("processsed {} from cache and {} from API".format(args.chunk - len(variants), len(variants)))
     
-    # Log stats
-    n_rows = len(tidy)
-    n_var  = tidy["variant_id"].nunique()
-    n_sc   = tidy["variant_scorer"].nunique()
-    print ("using {} variants".format(len(df)))
-    print ("using {} scorers".format(len(selected)))
-    print ("total rows {}".format(len(tidy)))
-    print("rows per track_name:", tidy.groupby("track_name").size().describe())
-    print("unique biosamples:", tidy["biosample_name"].nunique())
-    print("unique genes (gene-specific scorers):", tidy["gene_id"].nunique())
-
-    # Keep only needed cols
-    KEEP = ["variant_id", "output_type", "variant_scorer", "raw_score"]
-    tidy = tidy[KEEP].copy()
-    
-    # one scalar per (variant, track/scorer)
-    scores = (tidy.groupby(["variant_id","output_type","variant_scorer"], observed=True)
-                .raw_score.mean()
-                .rename("score")
-                .reset_index())
-
-    print("[AG] sample variant/track scores:\n",
-      scores.head(20).to_string(index=False))
-    
-    # wide matrix
-    wide = scores.pivot(index="variant_id",
-                        columns=["output_type","variant_scorer"],
-                        values="score")
-    wide.columns = [".".join(c) for c in wide.columns]
-
-    # optional zero-shot single column
-    zs = wide.mean(axis=1).rename("score").to_frame()
-
-    for p in [args.out_features, args.out_score]:
-        if p:
-            Path(p).parent.mkdir(parents=True, exist_ok=True)
-
-    # write only if paths were provided
-    if args.out_features: wide.reset_index().to_parquet(args.out_features, index=False)
-    if args.out_score:    zs.reset_index().to_parquet(args.out_score, index=False)
-
-
-    if not args.out_features and not args.out_score:
-        print("Nothing to write: provide --out-features and/or --out-score")
-
 
 if __name__ == "__main__":
     main()
