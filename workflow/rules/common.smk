@@ -526,6 +526,7 @@ def train_logistic_regression(X, y, groups):
         ('linear', LogisticRegression(
             class_weight="balanced",
             random_state=42,
+            max_iter=500,
         ))
     ])
     Cs = np.logspace(-8, 0, 10)

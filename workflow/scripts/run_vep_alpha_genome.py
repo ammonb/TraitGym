@@ -126,6 +126,7 @@ def process_chunk(results, out_features, out_score, chunk_count):
     #     print(f"{row['scorer']:<90} | {row['avg_scores']:>10} | {str(row['avg_bio_samples']):>15} | {str(row['avg_target_genes']):>17}")
 
 
+
     all_aggregated_rows = []
 
     for scorer_name, group in tidy.groupby("variant_scorer"):
@@ -147,23 +148,27 @@ def process_chunk(results, out_features, out_score, chunk_count):
                     .reset_index())
 
         elif mode == AggregationMode.NONE:
-            agg = group[["variant_id", "output_type", "raw_score"]].copy()
+            agg = (group.groupby(["variant_id", "output_type", "biosample_name", "gene_id"], observed=True)
+                    .raw_score.mean()
+                    .reset_index())
 
         agg["variant_scorer"] = scorer_name
         agg = agg.rename(columns={"raw_score": "score"})  # ensure score column name
         
         if "biosample_name" not in agg.columns:
             agg["biosample_name"] = "None"
+        if "gene_id" not in agg.columns:
+            agg["gene_id"] = "None"
 
         all_aggregated_rows.append(agg)
 
     scores = pd.concat(all_aggregated_rows, ignore_index=True)[
-        ["variant_id", "output_type", "variant_scorer", "biosample_name", "score"]
+        ["variant_id", "output_type", "variant_scorer", "biosample_name", "gene_id", "score"]
     ]
  
     # wide matrix
     wide = scores.pivot(index="variant_id",
-                        columns=["output_type","variant_scorer", "biosample_name"],
+                        columns=["output_type","variant_scorer", "biosample_name", "gene_id"],
                         values="score")
     
     # some scores don't exist for all regions. Impute with mean value
