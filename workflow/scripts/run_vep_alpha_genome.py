@@ -14,6 +14,22 @@ import argparse
 import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
+from enum import Enum, auto
+
+
+class AggregationMode(Enum):
+    AGGREGATE_ALL = auto()
+    BY_GENE = auto()
+    BY_BIO_SAMPLE = auto()
+    NONE = auto()
+
+
+AGGREGATION_POLICY = {
+    "CenterMaskScorer(requested_output=ATAC, width=501, aggregation_type=ACTIVE_SUM)": AggregationMode.BY_BIO_SAMPLE,
+    "CenterMaskScorer(requested_output=CHIP_HISTONE, width=2001, aggregation_type=ACTIVE_SUM)": AggregationMode.BY_BIO_SAMPLE,
+
+}
+
 
 from alphagenome.data import genome
 from alphagenome.models import dna_client, variant_scorers
@@ -73,27 +89,89 @@ def process_chunk(results, out_features, out_score, chunk_count):
     tidy["variant_scorer"]  = tidy["variant_scorer"].astype(str)
     tidy["raw_score"]       = pd.to_numeric(tidy["raw_score"], errors="coerce")
 
-    # Keep only needed cols
-    KEEP = ["variant_id", "output_type", "variant_scorer", "raw_score"]
-    tidy = tidy[KEEP].copy()
-    
-    counts = tidy.groupby(
-        ["variant_id", "output_type", "variant_scorer"], observed=True
-        ).raw_score.count().reset_index(name="count")
 
-    # one scalar per (variant, track/scorer)
-    scores = (tidy.groupby(["variant_id","output_type","variant_scorer"], observed=True)
-                .raw_score.mean()
-                .rename("score")
-                .reset_index())
+    # grouped_stats = []
+
+    # # Get list of unique scorers
+    # scorers = tidy["variant_scorer"].unique()
+
+    # for scorer in scorers:
+    #     tidy_subset = tidy[tidy["variant_scorer"] == scorer]
+        
+    #     per_variant = (
+    #         tidy_subset.groupby("variant_id")
+    #         .agg(
+    #             num_scores=("raw_score", "count"),
+    #             num_biosamples=("biosample_name", lambda x: x.nunique() if x.notna().any() else None),
+    #             num_genes=("gene_id", lambda x: x.nunique() if x.notna().any() else None),
+    #         )
+    #         .reset_index()
+    #     )
+
+    #     avg_scores = per_variant["num_scores"].mean()
+    #     avg_biosamples = per_variant["num_biosamples"].mean()
+    #     avg_genes = per_variant["num_genes"].mean()
+
+    #     grouped_stats.append({
+    #         "scorer": scorer,
+    #         "avg_scores": round(avg_scores, 1),
+    #         "avg_bio_samples": round(avg_biosamples, 1) if avg_biosamples is not None else "N/A",
+    #         "avg_target_genes": round(avg_genes, 1) if avg_genes is not None else "N/A"
+    #     })
+
+    # # Pretty print
+    # print(f"{'scorer':<90} | {'avg_scores':>10} | {'avg_bio_samples':>15} | {'avg_target_genes':>17}")
+    # print("-" * 140)
+    # for row in grouped_stats:
+    #     print(f"{row['scorer']:<90} | {row['avg_scores']:>10} | {str(row['avg_bio_samples']):>15} | {str(row['avg_target_genes']):>17}")
+
+
+    all_aggregated_rows = []
+
+    for scorer_name, group in tidy.groupby("variant_scorer"):
+        mode = AGGREGATION_POLICY.get(scorer_name, AggregationMode.AGGREGATE_ALL)
+
+        if mode == AggregationMode.AGGREGATE_ALL:
+            agg = (group.groupby(["variant_id", "output_type"], observed=True)
+                    .raw_score.mean()
+                    .reset_index())
+
+        elif mode == AggregationMode.BY_BIO_SAMPLE:
+            agg = (group.groupby(["variant_id", "output_type", "biosample_name"], observed=True)
+                    .raw_score.mean()
+                    .reset_index())
+
+        elif mode == AggregationMode.BY_GENE:
+            agg = (group.groupby(["variant_id", "output_type", "gene_id"], observed=True)
+                    .raw_score.mean()
+                    .reset_index())
+
+        elif mode == AggregationMode.NONE:
+            agg = group[["variant_id", "output_type", "raw_score"]].copy()
+
+        agg["variant_scorer"] = scorer_name
+        agg = agg.rename(columns={"raw_score": "score"})  # ensure score column name
+        
+        if "biosample_name" not in agg.columns:
+            agg["biosample_name"] = "None"
+
+        all_aggregated_rows.append(agg)
+
+    scores = pd.concat(all_aggregated_rows, ignore_index=True)[
+        ["variant_id", "output_type", "variant_scorer", "biosample_name", "score"]
+    ]
  
     # wide matrix
     wide = scores.pivot(index="variant_id",
-                        columns=["output_type","variant_scorer"],
+                        columns=["output_type","variant_scorer", "biosample_name"],
                         values="score")
     
     # some scores don't exist for all regions. Impute with mean value
     wide = wide.fillna(wide.mean())
+
+    if "variant_id" in wide.columns:
+        wide = wide.select_dtypes(exclude=['object'])
+
 
     wide.columns = [".".join(c) for c in wide.columns]
 
@@ -178,6 +256,9 @@ def main():
         sc for sc in all_scorers.values()
         if organism.value in variant_scorers.SUPPORTED_ORGANISMS[sc.base_variant_scorer]
     ]
+
+    for s in selected:
+        print("scorer: {}".format(s))
 
     chunk_count = 0
     for start in tqdm(range(0, len(df), args.chunk), desc=f"Scoring variants (chunk={args.chunk})"):
